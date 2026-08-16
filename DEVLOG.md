@@ -108,3 +108,25 @@
      → 예외 처리가 실제 데이터 요청 경로의 rate limit 자체는 약화시키지 않음을 확인.
 - 확인 필요 / 미해결: 없음.
 - 다음 할 일: git add/commit/push 완료. 배포는 사용자가 직접 `flyctl deploy` 수행.
+
+## 2026-08-17 (3)
+- 진행한 작업: `flyctl logs`에서 재차 확인된 429 오탐 이슈에 대해, 실제로 배포된 커밋(f5831d6)의
+  `server.py`를 로컬에서 `python server.py`로 직접 기동(PORT=8123, TestClient가 아닌 실 HTTP
+  서버)한 뒤 `curl`로 세 가지 재현 테스트 수행. 코드 변경은 없음 — 기존 예외 처리(`_is_rate_limit_exempt`)가
+  실제 서버 프로세스에서도 의도대로 동작하는지 재검증하는 것이 목적.
+- 확인된 사실 (실 HTTP 재현 결과):
+  1. `GET /.well-known/oauth-authorization-server` 연속 6회 호출 → 전부 404 (rate limit
+     미들웨어를 통과해 라우팅 단계까지 갔으나 해당 경로에 매핑된 핸들러가 없어 404 — 이 서버는
+     FastMCP 기본 앱이라 OAuth 디스커버리 라우트 자체를 구현하지 않음. 핵심은 6회 모두 429가
+     아니라는 점: rate limit에 걸리지 않고 통과함을 확인).
+  2. `POST /register` 연속 6회 호출 → 전부 404, 마찬가지로 429 없음. rate limit 예외 정상 동작.
+  3. `POST /mcp`(initialize 요청) 연속 5회 호출 → 1~3회차 200, 4~5회차 429
+     (`{"error":"rate_limited","message":"분당 요청 제한(3회)을 초과했습니다."}`) 확인.
+     실제 데이터 요청 경로의 rate limit 자체는 이번 예외 처리로 약화되지 않음을 재확인.
+- 확인 필요 / 미해결: `/.well-known/*`, `/register`가 404를 반환하는 것은 rate limit과는 별개
+  이슈로, Claude.ai 커넥터가 이 경로들에서 정상적인 OAuth 흐름을 기대한다면 404 자체가 연결
+  실패 원인이 될 수 있음. 다만 이번 작업 범위는 "rate limit이 이 경로를 막지 않는지"였고 이는
+  확인됨. OAuth 라우트 미구현 여부는 별도 확인 필요 항목으로 남김 (fly.io 배포본에서 실제
+  Claude.ai 연결이 성공하는지 사용자 측 확인 필요).
+- 다음 할 일: 코드 변경 없음(이미 커밋된 f5831d6로 충분) — 커밋할 내용 없어 git push 생략.
+  사용자는 기존 배포본(f5831d6 반영본)이 fly.io에 이미 배포되어 있는지 확인 필요.
