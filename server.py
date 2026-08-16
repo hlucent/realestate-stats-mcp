@@ -49,8 +49,17 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _is_rate_limit_exempt(path: str) -> bool:
+    """OAuth 핸드셰이크 경로(.well-known 디스커버리, 동적 클라이언트 등록)는
+    Claude.ai 연결 시마다 자동 호출되며 실제 데이터 조회가 아니므로 rate limit에서 제외한다."""
+    return path.startswith("/.well-known/") or path == "/register"
+
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        if _is_rate_limit_exempt(request.url.path):
+            return await call_next(request)
+
         ip = _client_ip(request)
         now = time.time()
 

@@ -86,3 +86,25 @@
   - fly.io 멀티머신 환경에서는 in-memory 저장소가 머신마다 분리되므로, 머신 간 rate limit이
     공유되지 않음 (설계상 허용된 단순화 — CLAUDE.md "확실하지 않으면 기본값 1개로 구현" 원칙 적용).
 - 다음 할 일: git add/commit/push 완료 후 CLAUDE.md 5절 안내 문구 출력하고 정지.
+
+## 2026-08-17 (2)
+- 진행한 작업: 실제 배포 후 `flyctl logs` 확인 결과, Claude.ai 커넥터 연결 시도 자체가 429로
+  차단되는 문제 발견 → 원인 분석 후 `server.py`의 `RateLimitMiddleware`에 경로 예외 처리 추가.
+- 원인: Claude.ai가 MCP 서버에 연결할 때 OAuth 핸드셰이크로 `GET /.well-known/oauth-authorization-server`
+  (및 관련 `.well-known` 디스커버리 경로), `POST /register`(동적 클라이언트 등록)를 자동으로
+  먼저 호출하는데, 기존 미들웨어는 모든 경로에 동일하게 분당 3회 제한을 적용하고 있었다.
+  커넥터가 연결/재연결할 때마다 이 핸드셰이크 경로를 여러 번 호출하면서 자체적으로 3회 한도를
+  넘겨 정상적인 연결 시도 자체가 429로 막히는 문제였다. 이 경로들은 실제 API 데이터 조회
+  (`POST /mcp`)가 아니라 프로토콜 수준의 인증/디스커버리 절차이므로 rate limit 대상이 아니다.
+- 수정 내용: `_is_rate_limit_exempt(path)` 함수를 추가해 `RateLimitMiddleware.dispatch`
+  진입 시 가장 먼저 확인 — `path.startswith("/.well-known/")` 또는 `path == "/register"`인
+  경우 카운트/차단 로직을 전혀 거치지 않고 즉시 `call_next(request)`로 통과시킨다.
+  실제 데이터 요청 경로(`/mcp`)는 기존 로직(분당 3회, 일일 30회, 위반 누적 24시간 차단) 그대로 유지.
+- 확인된 사실 (로컬 실측 결과, `starlette.testclient.TestClient`로 미들웨어 단위 테스트):
+  1. `/.well-known/oauth-authorization-server`에 10회 연속 요청 → 전부 200, 한 번도 429 없음
+     (예외 처리 전이었다면 4번째 요청부터 429였을 것).
+  2. `POST /register`에 10회 연속 요청 → 전부 200, 한 번도 429 없음.
+  3. 예외 대상이 아닌 `/mcp` 경로는 기존과 동일하게 3회까지 200, 4번째부터 429 확인
+     → 예외 처리가 실제 데이터 요청 경로의 rate limit 자체는 약화시키지 않음을 확인.
+- 확인 필요 / 미해결: 없음.
+- 다음 할 일: git add/commit/push 완료. 배포는 사용자가 직접 `flyctl deploy` 수행.
