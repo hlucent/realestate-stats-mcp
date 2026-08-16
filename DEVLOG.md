@@ -58,3 +58,31 @@
 - 확인 필요 / 미해결: 없음 (DEVPLAN 2절 5개 항목 전부 검증 완료).
 - 다음 할 일: FastMCP 서버 스모크 테스트(완료 — initialize 200 OK, 3개 툴 정상 노출),
   git add/commit/push 후 CLAUDE.md 4절 안내 문구 출력하고 정지.
+
+## 2026-08-17
+- 진행한 작업: DEVPLAN.md 4절 정정(2026-08-16, "공개 무인증 서버이므로 rate limit 예외 아님")에
+  따라 CLAUDE.md 2-7절 기준 rate limit 미들웨어를 `server.py`에 추가.
+  Starlette `BaseHTTPMiddleware`로 구현, `mcp.http_app(middleware=[...])`가 받는
+  `middleware: list[ASGIMiddleware]` 파라미터를 통해 `mcp.run(..., middleware=[Middleware(RateLimitMiddleware)])`
+  형태로 주입(FastMCP 3.4.5, `run`/`run_async`가 `**transport_kwargs`를 `http_app`으로 그대로 전달함을
+  코드 확인 후 적용).
+- 규칙 구현 내용:
+  - 분당 3회 초과 시 429 (`{"error":"rate_limited",...}`)
+  - 1시간 내 429가 5회 발생하면 해당 IP 24시간 차단 (`{"error":"blocked",...}`)
+  - 일일 30회 제한 (초과 시 마찬가지로 429, violation으로 카운트)
+  - IP 추출: `X-Forwarded-For` 헤더의 첫 값 사용 (fly.io 프록시 뒤에서 동작 전제, 헤더 없으면
+    `request.client.host` fallback)
+  - 저장소: in-memory (`dict[str, deque[float]]`), 서버 프로세스 생명주기 동안만 유지, 재시작 시 리셋
+- 확인된 사실 (로컬 실측 결과, PORT=8099 임시 인스턴스):
+  1. 정상 호출(분당 3회 이내) → `initialize` 요청에 200 정상 응답 확인.
+  2. 같은 IP로 4번째, 5번째 연속 요청 → 429 확인, 바디 `{"error":"rate_limited","message":"분당 요청 제한(3회)을 초과했습니다."}` 확인.
+  3. `X-Forwarded-For` 헤더로 다른 IP(9.9.9.9)를 준 요청은 별도 쿼터로 취급되어 200 정상 응답
+     → IP별 격리 정상 동작 확인.
+  4. 24시간 차단 로직(1시간 내 429 5회) 및 일일 30회 제한은 시간 스케일 문제로 이번 세션에서
+     실시간 재현 테스트는 생략(로직 리뷰로 확인) — **확인 필요로 기록**. 실제 운영 중 위반이
+     누적되면 `_violation_log`/`_blocked_until` 딕셔너리 상태로 fly.io 로그에서 관찰 가능.
+- 확인 필요 / 미해결:
+  - 24시간 차단 및 일일 30회 제한의 실시간(long-duration) 재현 테스트는 미실시 (로직 검토로 대체).
+  - fly.io 멀티머신 환경에서는 in-memory 저장소가 머신마다 분리되므로, 머신 간 rate limit이
+    공유되지 않음 (설계상 허용된 단순화 — CLAUDE.md "확실하지 않으면 기본값 1개로 구현" 원칙 적용).
+- 다음 할 일: git add/commit/push 완료 후 CLAUDE.md 5절 안내 문구 출력하고 정지.

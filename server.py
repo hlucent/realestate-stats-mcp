@@ -6,15 +6,91 @@ STATBL_ID로 분기해 재사용하는 R-ONE API 구조를 그대로 반영해, 
 """
 
 import os
+import time
+from collections import defaultdict, deque
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 import reb_api
 
 load_dotenv()
 
 mcp = FastMCP("realestate-stats-mcp")
+
+
+# --- Rate limit 미들웨어 (CLAUDE.md 2-7절 / DEVPLAN.md 4절 — 공개 무인증 서버이므로 적용) ---
+#
+# 규칙:
+#   - 분당 3회 초과 시 429
+#   - 1시간 내 429가 5회 발생하면 해당 IP를 24시간 차단
+#   - 일일 30회 제한
+#   - IP는 X-Forwarded-For 헤더에서 추출 (fly.io 프록시 뒤에서 동작)
+#   - in-memory 저장 (서버 프로세스 생명주기 동안만 유지, 재시작 시 리셋)
+_MINUTE_LIMIT = 3
+_DAILY_LIMIT = 30
+_VIOLATION_LIMIT = 5
+_BLOCK_SECONDS = 24 * 60 * 60
+_VIOLATION_WINDOW_SECONDS = 60 * 60
+
+_request_log: dict[str, deque[float]] = defaultdict(deque)
+_violation_log: dict[str, deque[float]] = defaultdict(deque)
+_blocked_until: dict[str, float] = {}
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        ip = _client_ip(request)
+        now = time.time()
+
+        blocked_at = _blocked_until.get(ip)
+        if blocked_at is not None:
+            if now < blocked_at:
+                return JSONResponse(
+                    {"error": "blocked", "message": "반복적인 요청 제한 위반으로 24시간 차단되었습니다."},
+                    status_code=429,
+                )
+            del _blocked_until[ip]
+            _violation_log.pop(ip, None)
+
+        req_times = _request_log[ip]
+        while req_times and now - req_times[0] > _VIOLATION_WINDOW_SECONDS * 24:
+            req_times.popleft()
+
+        minute_count = sum(1 for t in req_times if now - t <= 60)
+        daily_count = sum(1 for t in req_times if now - t <= 24 * 60 * 60)
+
+        limited = False
+        message = ""
+        if minute_count >= _MINUTE_LIMIT:
+            limited = True
+            message = "분당 요청 제한(3회)을 초과했습니다."
+        elif daily_count >= _DAILY_LIMIT:
+            limited = True
+            message = "일일 요청 제한(30회)을 초과했습니다."
+
+        if limited:
+            violations = _violation_log[ip]
+            violations.append(now)
+            while violations and now - violations[0] > _VIOLATION_WINDOW_SECONDS:
+                violations.popleft()
+            if len(violations) >= _VIOLATION_LIMIT:
+                _blocked_until[ip] = now + _BLOCK_SECONDS
+            return JSONResponse({"error": "rate_limited", "message": message}, status_code=429)
+
+        req_times.append(now)
+        return await call_next(request)
 
 
 @mcp.tool()
@@ -167,4 +243,10 @@ def get_statistics_data(
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port, stateless_http=True)
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=port,
+        stateless_http=True,
+        middleware=[Middleware(RateLimitMiddleware)],
+    )
